@@ -23,10 +23,9 @@ use std::sync::atomic::Ordering;
 
 use ryowm_render::gles::GlesBackend;
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::backend::winit::{WinitEvent, init as winit_init};
+use smithay::backend::winit::{init as winit_init, WinitEvent};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::Display;
-use smithay::reexports::winit::platform::pump_events::PumpStatus;
 use smithay::utils::Transform;
 
 fn main() -> anyhow::Result<()> {
@@ -45,12 +44,12 @@ fn main() -> anyhow::Result<()> {
     // (Phase 1 criteria — nested window, commit ack, clean disconnect,
     // xtask green, ADR-0004 — keep holding while rendering is added.)
 
-    let mut reactor = reactor::Reactor::try_new()?;
+    let reactor = reactor::Reactor::try_new()?;
     let display = Display::<wayland::RyoWmState>::new()?;
     let mut state = wayland::RyoWmState::new(display, reactor.handle());
 
     // Nested development window (no bare TTY needed for dev iteration).
-    let (backend, mut winit) = winit_init::<GlesRenderer>()
+    let (backend, winit) = winit_init::<GlesRenderer>()
         // `winit::Error` carries a non-Send/Sync source, so it cannot convert
         // into `anyhow::Error` via `?` — render it into the message instead.
         .map_err(|e| anyhow::anyhow!("Failed to initialize winit backend: {e}"))?;
@@ -88,38 +87,51 @@ fn main() -> anyhow::Result<()> {
     state.space.map_output(&output, (0, 0));
     let mut gles = GlesBackend::new(backend, output, &state.display_handle);
 
+    // The winit event loop is itself a calloop event source
+    // (`EventSource for WinitEventLoop`): window/input events wake the parked
+    // reactor instead of being polled. The callback only touches `&mut
+    // RyoWmState` — GPU work stays in the per-wakeup closure below, which
+    // owns the renderer.
+    // Note: `InsertError<WinitEventLoop>` cannot convert into anyhow via `?`
+    // (winit internals are not Send/Sync), so the error is rendered explicitly.
+    reactor
+        .handle()
+        .insert_source(
+            winit,
+            |event, _, state: &mut wayland::RyoWmState| match event {
+                WinitEvent::Resized { size, .. } => {
+                    tracing::info!(width = size.w, height = size.h, "Nested window resized");
+                    state.pending_resize = Some(size);
+                }
+                WinitEvent::Input(_) => {
+                    tracing::debug!(
+                        "Winit input event (unhandled; libinput owns input from Phase 3)"
+                    );
+                }
+                WinitEvent::CloseRequested => {
+                    tracing::info!("Nested window close requested, shutting down");
+                    state.running.store(false, Ordering::SeqCst);
+                }
+                // Host asked for a repaint (e.g. after occlusion): full damage.
+                WinitEvent::Redraw => {
+                    state.damage_all = true;
+                }
+                WinitEvent::Focus(_) => {}
+            },
+        )
+        .map_err(|err| anyhow::anyhow!("Failed to register winit event source: {:?}", err.error))?;
+
     tracing::info!("Entering main loop");
-    while state.running.load(Ordering::SeqCst) {
-        // Pump the nested window first: resizes, input, close requests.
-        let pump_status = winit.dispatch_new_events(|event| match event {
-            WinitEvent::Resized { size, .. } => {
-                tracing::info!(
-                    width = size.w,
-                    height = size.h,
-                    "Nested window resized"
-                );
-                gles.set_output_size(size);
-                state.damage_all = true;
-            }
-            WinitEvent::Input(_) => {
-                tracing::debug!("Winit input event (unhandled in Phase 1)");
-            }
-            WinitEvent::CloseRequested => {
-                tracing::info!("Nested window close requested, shutting down");
-                state.running.store(false, Ordering::SeqCst);
-            }
-            WinitEvent::Focus(_) | WinitEvent::Redraw => {}
-        });
-
-        if let PumpStatus::Exit(_) = pump_status {
-            break;
+    reactor.run(&mut state, |state| {
+        if let Some(size) = state.pending_resize.take() {
+            gles.set_output_size(size);
+            state.damage_all = true;
         }
-
-        reactor.dispatch(&mut state)?;
-        scene::render_frame(&mut state, &mut gles)?;
+        scene::render_frame(state, &mut gles)?;
         state.space.refresh();
         state.display_handle.flush_clients()?;
-    }
+        Ok(())
+    })?;
 
     tracing::info!("RyoWM shut down cleanly");
     Ok(())

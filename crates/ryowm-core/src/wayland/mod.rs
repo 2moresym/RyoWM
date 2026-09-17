@@ -14,20 +14,19 @@ use smithay::{
     backend::renderer::utils::on_commit_buffer_handler,
     delegate_compositor, delegate_output, delegate_seat, delegate_shm, delegate_xdg_shell,
     desktop::{Space, Window},
-    input::{Seat, SeatHandler, SeatState, keyboard::XkbConfig, pointer::PointerHandle},
+    input::{keyboard::XkbConfig, pointer::PointerHandle, Seat, SeatHandler, SeatState},
     reexports::{
-        calloop::{Interest, Mode, PostAction, generic::Generic},
+        calloop::{generic::Generic, Interest, Mode, PostAction},
         wayland_server::{
-            Client,
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::{wl_buffer, wl_surface},
-            Display, DisplayHandle, Resource,
+            Client, Display, DisplayHandle, Resource,
         },
     },
-    utils::{Clock, Monotonic},
+    utils::{Clock, Monotonic, Physical, Size},
     wayland::{
         buffer::BufferHandler,
-        compositor::{CompositorClientState, CompositorHandler, CompositorState, get_parent},
+        compositor::{get_parent, CompositorClientState, CompositorHandler, CompositorState},
         output::OutputHandler,
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
@@ -85,6 +84,10 @@ pub struct RyoWmState {
     pub pending_damage: Option<Rect>,
     /// Full-output repaint request (window destroyed, output resized).
     pub damage_all: bool,
+    /// Resize reported by the backend, not yet applied to the output.
+    /// Applied by the main loop (which owns the renderer) after wakeup —
+    /// calloop source callbacks only see `&mut RyoWmState`, never the GPU.
+    pub pending_resize: Option<Size<i32, Physical>>,
     /// Frame presentation clock for client `frame` callbacks.
     pub clock: Clock<Monotonic>,
 }
@@ -114,20 +117,17 @@ impl RyoWmState {
             .expect("Failed to register Wayland display with the reactor");
 
         // Accept clients on an auto-allocated Wayland socket.
-        let source =
-            ListeningSocketSource::new_auto().expect("Failed to bind Wayland socket");
+        let source = ListeningSocketSource::new_auto().expect("Failed to bind Wayland socket");
         let socket_name = source.socket_name().to_string_lossy().into_owned();
         info!(socket = socket_name, "Listening for Wayland clients");
 
         handle
-            .insert_source(source, |client_stream, _, data: &mut RyoWmState| {
-                match data.display_handle.insert_client(
-                    client_stream,
-                    Arc::new(ClientState::default()),
-                ) {
-                    Ok(_) => info!("Wayland client connected"),
-                    Err(err) => warn!("Error adding Wayland client: {}", err),
-                }
+            .insert_source(source, |client_stream, _, data: &mut RyoWmState| match data
+                .display_handle
+                .insert_client(client_stream, Arc::new(ClientState::default()))
+            {
+                Ok(_) => info!("Wayland client connected"),
+                Err(err) => warn!("Error adding Wayland client: {}", err),
             })
             .expect("Failed to register Wayland socket with the reactor");
 
@@ -155,6 +155,7 @@ impl RyoWmState {
             space: Space::default(),
             pending_damage: None,
             damage_all: false,
+            pending_resize: None,
             clock: Clock::new(),
         }
     }
@@ -168,9 +169,7 @@ impl RyoWmState {
         }
         self.space
             .elements()
-            .find(|window| {
-                window.toplevel().map(|toplevel| toplevel.wl_surface()) == Some(&root)
-            })
+            .find(|window| window.toplevel().map(|toplevel| toplevel.wl_surface()) == Some(&root))
             .cloned()
     }
 
