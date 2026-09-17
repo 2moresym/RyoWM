@@ -7,3 +7,5 @@ repository.workspace = true
 
 [dependencies]
 ryowm-common.workspace = true
+smithay.workspace = true
+tracing.workspace = true

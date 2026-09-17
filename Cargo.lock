@@ -1425,6 +1425,8 @@ name = "ryowm-render"
 version = "0.1.0"
 dependencies = [
  "ryowm-common",
+ "smithay",
+ "tracing",
 ]
 
 [[package]]

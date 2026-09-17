@@ -1,6 +1,13 @@
 //! Renderer abstraction (architecture doc §2.6, §8.2). GLES/EGL backend is
 //! the required implementation (Phase 2); Vulkan backend is optional and
 //! not started before Phase 12.
+//!
+//! | Subsystem | Responsibility | Process | Threading | Failure behavior |
+//! |---|---|---|---|---|
+//! | Renderer | GPU frame composition, damage tracking, present | in-proc | main thread drives `GlesBackend` per frame (dedicated render thread arrives with output threading work) | GPU device lost/reset → log + `PresentResult::Failed` for the frame, compositor keeps running; repeated failure is a follow-up (recovery state machine is hardening work, not Phase 2) |
+
+pub mod damage;
+pub mod gles;
 
 use ryowm_common::{OutputId, Rect};
 
