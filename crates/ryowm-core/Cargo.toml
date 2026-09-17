@@ -14,6 +14,9 @@ calloop.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+rtrb.workspace = true
+xcursor.workspace = true
+input.workspace = true
 
 [[bin]]
 name = "ryowm"

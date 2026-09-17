@@ -22,6 +22,14 @@ Recorded before adding crate manifests; versions and features follow the Phase 0
 
 No Vulkan feature or extra external crate is introduced in Phase 0/1. Internal path dependencies maintain the common → protocol/render → core boundaries. `xtask` uses only the standard library.
 
+## Phase 3 additions (`ryowm-core`)
+
+| Dependency | Justification |
+|---|---|
+| rtrb 0.4 | Lock-free SPSC ring buffer for the input-thread → main-thread event channel (architecture §5: channel-based handoff, never shared-mutex state). |
+| input 0.9 (default features, i.e. udev) | Direct libinput bindings with udev seat enumeration for the dedicated input thread. Smithay's re-export of `input` disables default features (no udev), so `new_with_udev` is unavailable through it — a direct dependency is required. Version pinned to the 0.9.1 already in the tree. |
+| xcursor 0.3 | Parse the system cursor theme for the visible pointer image instead of hand-rolling Xcursor parsing. Version pinned to the 0.3.11 already in the tree. |
+
 ## Phase 2 additions (`ryowm-render`)
 
 | Dependency | Justification |

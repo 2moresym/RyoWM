@@ -26,6 +26,9 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 thiserror = "2"
 anyhow = "1"
+rtrb = "0.4"
+xcursor = "0.3"
+input = { version = "0.9" }
 ryowm-common = { path = "crates/ryowm-common" }
 ryowm-render = { path = "crates/ryowm-render" }
 ryowm-protocol = { path = "crates/ryowm-protocol" }
