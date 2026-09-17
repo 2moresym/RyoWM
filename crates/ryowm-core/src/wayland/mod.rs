@@ -9,8 +9,10 @@
 
 use std::sync::{atomic::AtomicBool, Arc};
 
+use ryowm_common::Rect;
 use smithay::{
-    delegate_compositor, delegate_seat, delegate_shm, delegate_xdg_shell,
+    backend::renderer::utils::on_commit_buffer_handler,
+    delegate_compositor, delegate_output, delegate_seat, delegate_shm, delegate_xdg_shell,
     desktop::{Space, Window},
     input::{Seat, SeatHandler, SeatState, keyboard::XkbConfig, pointer::PointerHandle},
     reexports::{
@@ -22,9 +24,11 @@ use smithay::{
             Display, DisplayHandle, Resource,
         },
     },
+    utils::{Clock, Monotonic},
     wayland::{
         buffer::BufferHandler,
-        compositor::{CompositorClientState, CompositorHandler, CompositorState},
+        compositor::{CompositorClientState, CompositorHandler, CompositorState, get_parent},
+        output::OutputHandler,
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
         },
@@ -72,8 +76,17 @@ pub struct RyoWmState {
     #[allow(dead_code)]
     pub pointer: PointerHandle<RyoWmState>,
 
-    // Desktop workspace. Empty in Phase 1 (no window management yet).
+    // Desktop workspace. Phase 2 maps toplevels here for compositing only;
+    // window lifecycle/focus stay Phase 4 work (see `window/mod.rs`).
     pub space: Space<Window>,
+
+    /// Damage accumulated since the last presented frame, consumed by the
+    /// scene renderer each iteration.
+    pub pending_damage: Option<Rect>,
+    /// Full-output repaint request (window destroyed, output resized).
+    pub damage_all: bool,
+    /// Frame presentation clock for client `frame` callbacks.
+    pub clock: Clock<Monotonic>,
 }
 
 impl RyoWmState {
@@ -140,7 +153,35 @@ impl RyoWmState {
             seat,
             pointer,
             space: Space::default(),
+            pending_damage: None,
+            damage_all: false,
+            clock: Clock::new(),
         }
+    }
+
+    /// Mapped window owning `surface`, following subsurface links to the
+    /// toplevel root, if any.
+    fn find_window_for_surface(&self, surface: &wl_surface::WlSurface) -> Option<Window> {
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        self.space
+            .elements()
+            .find(|window| {
+                window.toplevel().map(|toplevel| toplevel.wl_surface()) == Some(&root)
+            })
+            .cloned()
+    }
+
+    fn window_rect(window: &Window) -> Rect {
+        let geometry = window.geometry();
+        Rect::new(
+            geometry.loc.x,
+            geometry.loc.y,
+            geometry.size.w,
+            geometry.size.h,
+        )
     }
 }
 
@@ -156,13 +197,34 @@ impl CompositorHandler for RyoWmState {
     }
 
     fn commit(&mut self, surface: &wl_surface::WlSurface) {
-        // Phase 1 "acknowledged" bar: log the commit. Nothing is composited
-        // or rendered — that is explicitly out of scope until Phase 2, which
-        // also takes over surface-size tracking via the scene graph.
+        // Required first: moves the committed buffer into Smithay's renderer
+        // surface state. Without this, surface trees stay empty and nothing
+        // is ever composited (see `gles::GlesBackend`).
+        on_commit_buffer_handler::<RyoWmState>(surface);
         info!(
             surface = surface.id().protocol_id(),
-            "Acknowledged client buffer commit (Phase 1: accepted, not rendered)"
+            "Acknowledged client buffer commit"
         );
+        // Phase 2: feed the damage tracker. `on_commit` refreshes the
+        // window's bounding box from the new buffer first — without it the
+        // geometry below stays empty and damage would be lost.
+        match self.find_window_for_surface(surface) {
+            Some(window) => {
+                window.on_commit();
+                let region = Self::window_rect(&window);
+                if region.is_empty() {
+                    self.damage_all = true;
+                } else {
+                    self.pending_damage = Some(match self.pending_damage {
+                        Some(pending) => pending.union(&region),
+                        None => region,
+                    });
+                }
+            }
+            // Unmapped surface (e.g. popups, which Phase 2 does not composite
+            // yet): repaint everything rather than risk a stale frame.
+            None => self.damage_all = true,
+        }
     }
 }
 
@@ -184,13 +246,36 @@ impl XdgShellHandler for RyoWmState {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        // Send an initial configure so the client commits a buffer we can
-        // acknowledge per the Phase 1 exit criterion.
+        // Send an initial configure so the client commits a buffer.
         surface.with_pending_state(|state| {
             state.size = Some((800, 600).into());
         });
         surface.send_configure();
-        info!("New xdg_toplevel created, sent initial configure (800x600)");
+        // Phase 2 compositing attachment only: map the window so the renderer
+        // picks it up. Placement, focus, and lifecycle stay Phase 4 work —
+        // every mapped window stacks at the origin until tiling lands.
+        let window = Window::new_wayland_window(surface);
+        self.space.map_element(window, (0, 0), false);
+        info!("New xdg_toplevel created, mapped for compositing, sent initial configure (800x600)");
+    }
+
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        let destroyed = surface.wl_surface().clone();
+        // Bind first: a temporary in the `if let` scrutinee would keep the
+        // immutable borrow of `space` alive across `unmap_elem` below.
+        let removed = self
+            .space
+            .elements()
+            .find(|window| {
+                window.toplevel().map(|toplevel| toplevel.wl_surface()) == Some(&destroyed)
+            })
+            .cloned();
+        if let Some(window) = removed {
+            self.space.unmap_elem(&window);
+            info!("Unmapped destroyed toplevel");
+        }
+        // The uncovered area needs repainting next frame.
+        self.damage_all = true;
     }
 
     fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {
@@ -240,9 +325,12 @@ impl SeatHandler for RyoWmState {
     }
 }
 
+impl OutputHandler for RyoWmState {}
+
 // --- Delegate macros: route protocol messages to the handlers above ---
 
 delegate_compositor!(RyoWmState);
 delegate_shm!(RyoWmState);
 delegate_xdg_shell!(RyoWmState);
 delegate_seat!(RyoWmState);
+delegate_output!(RyoWmState);

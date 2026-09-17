@@ -21,10 +21,13 @@ mod xwayland;
 
 use std::sync::atomic::Ordering;
 
+use ryowm_render::gles::GlesBackend;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::winit::{WinitEvent, init as winit_init};
+use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::Display;
 use smithay::reexports::winit::platform::pump_events::PumpStatus;
+use smithay::utils::Transform;
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -34,35 +37,56 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    tracing::info!("RyoWM starting (Phase 1: minimal Wayland compositor)");
+    tracing::info!("RyoWM starting (Phase 2: GLES rendering)");
 
-    // Phase 1 exit criteria (build brief §2.2):
-    // 1. `cargo run -p ryowm-core` opens a nested winit window, no crash.
-    // 2. An xdg_shell test client commit -> logged ack, no protocol error/hang.
-    // 3. Clean client disconnect, no crash or leaked Wayland resources.
-    // 4. `cargo xtask check` still passes.
-    // 5. ADR-0004 records the anvil-wiring boundary.
+    // Phase 2 exit criteria (architecture doc §14):
+    // 1. The Phase-1 client's window is visibly rendered on screen.
+    // 2. Idle-frame-suppression verified: no GPU work during no-damage idle.
+    // (Phase 1 criteria — nested window, commit ack, clean disconnect,
+    // xtask green, ADR-0004 — keep holding while rendering is added.)
 
     let mut reactor = reactor::Reactor::try_new()?;
     let display = Display::<wayland::RyoWmState>::new()?;
     let mut state = wayland::RyoWmState::new(display, reactor.handle());
 
     // Nested development window (no bare TTY needed for dev iteration).
-    // Rendering is Phase 2; here the backend only provides the window and
-    // the input/event pump. `_backend` is kept alive for the life of `main`
-    // so the window (and its EGL context) stays valid.
-    // `winit::Error` carries a non-Send/Sync source, so it cannot convert
-    // into `anyhow::Error` via `?` — render it into the message instead.
-    let (_backend, mut winit) = winit_init::<GlesRenderer>()
+    let (backend, mut winit) = winit_init::<GlesRenderer>()
+        // `winit::Error` carries a non-Send/Sync source, so it cannot convert
+        // into `anyhow::Error` via `?` — render it into the message instead.
         .map_err(|e| anyhow::anyhow!("Failed to initialize winit backend: {e}"))?;
-    {
-        let size = _backend.window_size();
-        tracing::info!(
-            width = size.w,
-            height = size.h,
-            "Nested winit window opened"
-        );
-    }
+    let size = backend.window_size();
+    tracing::info!(
+        width = size.w,
+        height = size.h,
+        "Nested winit window opened"
+    );
+
+    // Single hardcoded output for the nested window. Output enumeration,
+    // hotplug, and multi-output mapping are Phase 7 work; Phase 2 only
+    // needs one output to present client frames to.
+    let mode = Mode {
+        size,
+        refresh: 60_000,
+    };
+    let output = Output::new(
+        "winit-0".to_string(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "RyoWM".into(),
+            model: "Winit".into(),
+        },
+    );
+    let _output_global = output.create_global::<wayland::RyoWmState>(&state.display_handle);
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Flipped180),
+        None,
+        Some((0, 0).into()),
+    );
+    output.set_preferred(mode);
+    state.space.map_output(&output, (0, 0));
+    let mut gles = GlesBackend::new(backend, output, &state.display_handle);
 
     tracing::info!("Entering main loop");
     while state.running.load(Ordering::SeqCst) {
@@ -74,6 +98,8 @@ fn main() -> anyhow::Result<()> {
                     height = size.h,
                     "Nested window resized"
                 );
+                gles.set_output_size(size);
+                state.damage_all = true;
             }
             WinitEvent::Input(_) => {
                 tracing::debug!("Winit input event (unhandled in Phase 1)");
@@ -90,6 +116,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         reactor.dispatch(&mut state)?;
+        scene::render_frame(&mut state, &mut gles)?;
         state.space.refresh();
         state.display_handle.flush_clients()?;
     }
