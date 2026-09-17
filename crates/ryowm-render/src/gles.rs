@@ -27,31 +27,37 @@ use ryowm_common::{OutputId, Rect};
 use smithay::{
     backend::{
         renderer::{
+            ImportAll, ImportMem,
             damage::OutputDamageTracker,
-            element::{AsRenderElements, surface::WaylandSurfaceRenderElement},
+            element::{
+                AsRenderElements, Kind,
+                memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
+                surface::WaylandSurfaceRenderElement,
+            },
             gles::GlesRenderer,
         },
         winit::WinitGraphicsBackend,
     },
     desktop::space::SurfaceTree,
     output::{Mode, Output},
+    render_elements,
     reexports::wayland_server::{
-        Resource,
-        backend::ObjectId,
-        protocol::wl_surface::WlSurface,
-        DisplayHandle,
+        backend::ObjectId, protocol::wl_surface::WlSurface, DisplayHandle, Resource,
     },
-    utils::{IsAlive, Physical, Point, Rectangle, Scale, Size},
+    utils::{IsAlive, Logical, Physical, Point, Rectangle, Scale, Size},
 };
 use tracing::{debug, info, warn};
 
-use super::{
-    FrameToken, PresentResult, RenderBackend, SurfaceHandle,
-    damage::PendingFrame,
-};
+use super::{damage::PendingFrame, FrameToken, PresentResult, RenderBackend, SurfaceHandle};
+
+render_elements! {
+    pub OutputRenderElement<R> where R: ImportAll + ImportMem;
+    Surface=WaylandSurfaceRenderElement<R>,
+    Memory=MemoryRenderBufferRenderElement<R>,
+}
 
 /// Entry in the per-frame compositing queue, resolved to a concrete surface.
-/// Already back-to-front ordered by `PendingFrame::take_submission`.
+/// Already front-to-back ordered by `PendingFrame::take_submission`.
 struct QueuedEntry {
     surface: WlSurface,
     geometry: Rect,
@@ -67,6 +73,10 @@ pub struct GlesBackend {
     next_handle: u64,
     frame: Option<PendingFrame>,
     next_token: u64,
+    cursor: Option<MemoryRenderBuffer>,
+    cursor_hotspot: (i32, i32),
+    cursor_position: Point<f64, Logical>,
+    last_presented_cursor_position: Option<Point<f64, Logical>>,
 }
 
 impl GlesBackend {
@@ -92,6 +102,10 @@ impl GlesBackend {
             next_handle: 0,
             frame: None,
             next_token: 0,
+            cursor: None,
+            cursor_hotspot: (0, 0),
+            cursor_position: Point::default(),
+            last_presented_cursor_position: None,
         }
     }
 
@@ -118,7 +132,8 @@ impl GlesBackend {
             size,
             refresh: 60_000,
         };
-        self.output.change_current_state(Some(mode), None, None, None);
+        self.output
+            .change_current_state(Some(mode), None, None, None);
         self.output.set_preferred(mode);
     }
 
@@ -135,6 +150,19 @@ impl GlesBackend {
         handle
     }
 
+    /// Install the pointer image (theme pixels + hotspot). Called once at
+    /// startup and whenever the image changes, not per frame.
+    pub fn set_cursor(&mut self, buffer: MemoryRenderBuffer, hotspot: (i32, i32)) {
+        self.cursor = Some(buffer);
+        self.cursor_hotspot = hotspot;
+    }
+
+    /// Update the pointer position, called every frame from the seat's
+    /// tracked location. Cheap by design — no allocation, no GPU work.
+    pub fn set_cursor_position(&mut self, position: Point<f64, Logical>) {
+        self.cursor_position = position;
+    }
+
     /// Drop registry entries whose clients are gone. Called once per frame
     /// by the core so dead surfaces never accumulate (Phase 1's no-leak bar,
     /// extended to renderer-side handles).
@@ -148,10 +176,7 @@ impl GlesBackend {
         });
     }
 
-    fn resolve_queue(
-        &self,
-        queue: Vec<super::damage::QueuedSurface>,
-    ) -> Vec<QueuedEntry> {
+    fn resolve_queue(&self, queue: Vec<super::damage::QueuedSurface>) -> Vec<QueuedEntry> {
         queue
             .into_iter()
             .filter_map(|entry| {
@@ -201,19 +226,35 @@ impl RenderBackend for GlesBackend {
     }
 
     fn present(&mut self, frame: FrameToken) -> PresentResult {
-        let pending = match self.frame.take() {
+        let mut pending = match self.frame.take() {
             Some(open) if open.token() == frame => open,
             _ => {
                 warn!("present for unknown frame token");
                 return PresentResult::Failed;
             }
         };
+        // Cursor movement unconditionally forces a submission. The mark's
+        // region is only a present/skip switch — the damage tracker diffs the
+        // real pixels itself — so a 1px probe suffices and no cursor geometry
+        // needs plumbing through the core.
+        if self.last_presented_cursor_position != Some(self.cursor_position) {
+            pending.mark_damage(Rect::new(
+                self.cursor_position.x as i32,
+                self.cursor_position.y as i32,
+                1,
+                1,
+            ));
+        }
         let Some(submission) = pending.take_submission() else {
             // Idle-frame suppression: no damage was marked, so no GPU work
             // happens at all — no bind, no render, no submit.
             debug!("Skipping frame: no damage");
             return PresentResult::SkippedNoDamage;
         };
+        // Slow-present detector: a healthy nested swap completes inside one
+        // host frame (~16ms). Anything slower means the submit path (host
+        // compositor/GPU contention), not our render code, is the bottleneck.
+        let present_start = std::time::Instant::now();
 
         // Resolve everything borrowing `self` before `bind()` hands out a
         // `&mut` borrow of the backend.
@@ -233,15 +274,37 @@ impl RenderBackend for GlesBackend {
                 }
             };
 
-        let mut elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
-        for entry in &queue {
+            let mut elements: Vec<OutputRenderElement<GlesRenderer>> = Vec::new();
+            // Cursor first: it is always the frontmost element.
+            if let Some(buffer) = &self.cursor {
+                let position = (self.cursor_position
+                    - Point::<f64, Logical>::from((
+                        self.cursor_hotspot.0 as f64,
+                        self.cursor_hotspot.1 as f64,
+                    )))
+                .to_physical(scale)
+                .to_f64();
+                match MemoryRenderBufferRenderElement::from_buffer(
+                    renderer,
+                    position,
+                    buffer,
+                    None,
+                    None,
+                    None,
+                    Kind::Cursor,
+                ) {
+                    Ok(element) => elements.push(element.into()),
+                    Err(err) => warn!("Cursor render failed: {err}"),
+                }
+            }
+            for entry in &queue {
                 let tree = SurfaceTree::from_surface(&entry.surface);
                 let location = Point::<i32, Physical>::from((
                     (entry.geometry.x as f64 * scale_factor).round() as i32,
                     (entry.geometry.y as f64 * scale_factor).round() as i32,
                 ));
-            elements.extend(tree.render_elements(renderer, location, scale, 1.0));
-        }
+                elements.extend(tree.render_elements(renderer, location, scale, 1.0));
+            }
 
             match self.tracker.render_output(
                 renderer,
@@ -265,6 +328,14 @@ impl RenderBackend for GlesBackend {
             warn!("Failed to submit frame: {err}");
             return PresentResult::Failed;
         }
+        let elapsed = present_start.elapsed();
+        if elapsed > std::time::Duration::from_millis(20) {
+            debug!(
+                millis = elapsed.as_millis(),
+                "Slow present: submit path slower than one host frame"
+            );
+        }
+        self.last_presented_cursor_position = Some(self.cursor_position);
         PresentResult::Presented
     }
 }

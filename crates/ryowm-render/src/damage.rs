@@ -69,9 +69,11 @@ impl PendingFrame {
 
     /// Consume the frame. Returns `None` when no damage was ever marked —
     /// the caller must skip all GPU work (idle-frame suppression).
+    /// The queue comes out front-to-back (highest `z` first), matching
+    /// Smithay's `render_output` element order.
     pub fn take_submission(mut self) -> Option<FrameSubmission> {
         let damage = self.damage?;
-        self.queue.sort_by_key(|entry| entry.z);
+        self.queue.sort_by_key(|entry| std::cmp::Reverse(entry.z));
         Some(FrameSubmission {
             damage,
             queue: self.queue,
@@ -106,13 +108,13 @@ mod tests {
     }
 
     #[test]
-    fn queue_is_sorted_back_to_front() {
+    fn queue_is_sorted_front_to_back() {
         let mut frame = PendingFrame::new(FrameToken(3));
         frame.mark_damage(Rect::new(0, 0, 100, 100));
         frame.push(SurfaceHandle(1), Rect::new(0, 0, 10, 10), 5);
         frame.push(SurfaceHandle(2), Rect::new(0, 0, 10, 10), 1);
         let sub = frame.take_submission().expect("damage was marked");
         let zs: Vec<u32> = sub.queue.iter().map(|entry| entry.z).collect();
-        assert_eq!(zs, vec![1, 5]);
+        assert_eq!(zs, vec![5, 1]);
     }
 }
