@@ -21,3 +21,10 @@ Recorded before adding crate manifests; versions and features follow the Phase 0
 | libwayland, libxkbcommon | Wayland/EGL transport and keyboard support used by Smithay and its nested backend. |
 
 No Vulkan feature or extra external crate is introduced in Phase 0/1. Internal path dependencies maintain the common → protocol/render → core boundaries. `xtask` uses only the standard library.
+
+## Phase 2 additions (`ryowm-render`)
+
+| Dependency | Justification |
+|---|---|
+| smithay 0.7.0 (for `ryowm-render`) | `gles::GlesBackend` drives Smithay's `GlesRenderer`/`OutputDamageTracker` directly; reusing the toolkit's GL abstraction instead of hand-rolling EGL. |
+| tracing 0.1 (for `ryowm-render`) | Frame present/skip/failure logs from the render backend (failure behavior per architecture §3). |
