@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ryowm-common",
+    "crates/ryowm-protocol",
+    "crates/ryowm-render",
+    "crates/ryowm-ffi",
+    "crates/ryowm-core",
+    "xtask",
+]
+
+[workspace.dependencies]
+smithay = { version = "0.7.0", default-features = false, features = [
+    "backend_drm", "backend_gbm", "backend_libinput", "backend_udev",
+    "backend_session_libseat", "backend_egl", "backend_winit",
+    "renderer_gl", "xwayland", "desktop", "wayland_frontend",
+] }
+wayland-server = "0.31"
+wayland-protocols = "0.32"
+calloop = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-journald = "0.3"
+zbus = "5"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+anyhow = "1"
+ryowm-common = { path = "crates/ryowm-common" }
+ryowm-render = { path = "crates/ryowm-render" }
+ryowm-protocol = { path = "crates/ryowm-protocol" }
+
+[workspace.package]
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/2moresym/RyoWM"
+
+[profile.release]
+lto = "thin"
