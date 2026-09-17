@@ -21,7 +21,12 @@ pub struct Rect {
 
 impl Rect {
     pub fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -29,8 +34,12 @@ impl Rect {
     }
 
     pub fn union(&self, other: &Rect) -> Rect {
-        if self.is_empty() { return *other; }
-        if other.is_empty() { return *self; }
+        if self.is_empty() {
+            return *other;
+        }
+        if other.is_empty() {
+            return *self;
+        }
         let x0 = self.x.min(other.x);
         let y0 = self.y.min(other.y);
         let x1 = (self.x + self.width).max(other.x + other.width);
@@ -40,7 +49,12 @@ impl Rect {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Direction { Up, Down, Left, Right }
+pub enum Direction {
+    Up,
+    Down,
+    Left,
+    Right,
+}
 
 #[cfg(test)]
 mod tests {

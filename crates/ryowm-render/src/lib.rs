@@ -35,7 +35,13 @@ pub trait RenderBackend {
     fn mark_damage(&mut self, frame: FrameToken, region: Rect);
 
     /// Queue a surface for compositing at the given geometry and z-order.
-    fn composite_surface(&mut self, frame: FrameToken, surface: SurfaceHandle, geometry: Rect, z: u32);
+    fn composite_surface(
+        &mut self,
+        frame: FrameToken,
+        surface: SurfaceHandle,
+        geometry: Rect,
+        z: u32,
+    );
 
     /// Submit the frame. Must return `SkippedNoDamage` if no damage was
     /// marked for this frame token.
