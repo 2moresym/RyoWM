@@ -311,8 +311,17 @@ impl SeatHandler for RyoWmState {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&Self::KeyboardFocus>) {
-        // Phase 1: no focus tracking yet.
+    fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&Self::KeyboardFocus>) {
+        // Exit 2 evidence: every keyboard focus switch is logged.
+        // Data-device focus follows in the clipboard phase; the seat already
+        // routes key events to whichever surface holds keyboard focus.
+        match focused {
+            Some(surface) => info!(
+                surface = surface.id().protocol_id(),
+                "Keyboard focus changed"
+            ),
+            None => info!("Keyboard focus cleared"),
+        }
     }
 
     fn cursor_image(

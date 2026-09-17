@@ -15,7 +15,7 @@
 //! frame is logged and skipped, the compositor keeps running (architecture
 //! doc §3 failure-behavior contract).
 
-use ryowm_render::{PresentResult, RenderBackend, gles::GlesBackend};
+use ryowm_render::{gles::GlesBackend, PresentResult, RenderBackend};
 
 use crate::wayland::RyoWmState;
 
@@ -76,12 +76,9 @@ pub fn render_frame(
                 // drip-feed occluded surfaces on the overdue fallback; with a
                 // single output and no occlusion tracking yet, every mapped
                 // surface reports this output as primary, so `None` is exact.)
-                window.send_frame(
-                    &output,
-                    state.clock.now(),
-                    None,
-                    |_, _| Some(output.clone()),
-                );
+                window.send_frame(&output, state.clock.now(), None, |_, _| {
+                    Some(output.clone())
+                });
             }
             Ok(FrameOutcome::Presented)
         }
