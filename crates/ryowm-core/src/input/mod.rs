@@ -56,8 +56,9 @@ use smithay::{
 use tracing::{debug, info, warn};
 
 use crate::{
+    layout::{LayoutKind, RATIO_STEP},
     wayland::RyoWmState,
-    window::{DragMode, DragState, window_output_rect},
+    window::{DragMode, DragState, WindowMode, window_output_rect},
 };
 
 /// Normalized input event crossing the thread boundary. Plain data only —
@@ -286,21 +287,61 @@ pub fn dispatch_input_event(state: &mut RyoWmState, event: InputEvent) {
                     serial,
                     time_ms,
                     |state, modifiers, keysym| {
-                        // TEMPORARY Phase 4 placeholder trigger (the keybind
-                        // engine in Phase 8 replaces this, not extends it):
-                        // Alt+Q closes the focused window. Stateless: press
-                        // and release are both intercepted while Alt is held,
-                        // so no stuck keys. Alt (not Super) keeps nested
-                        // testing clear of the host compositor's Super
-                        // bindings. Raw (unshifted) syms, US layout assumed.
+                        // TEMPORARY Phase 4/5 placeholder triggers (the
+                        // keybind engine in Phase 8 replaces these, not
+                        // extends them): Alt+Q closes, Alt+H/L shrink/grow
+                        // the master ratio, Alt+M toggles tiling/monocle.
+                        // Stateless: press and release are both intercepted
+                        // while Alt is held, so no stuck keys. Alt (not
+                        // Super) keeps nested testing clear of the host
+                        // compositor's Super bindings. Raw syms, US layout.
                         const Q: u32 = 0x71;
-                        let close_requested = modifiers.alt
-                            && keysym.raw_syms().into_iter().any(|sym| u32::from(sym) == Q);
-                        if close_requested {
-                            close_focused_window(state);
-                            FilterResult::Intercept(())
-                        } else {
-                            FilterResult::Forward
+                        const H: u32 = 0x68;
+                        const L: u32 = 0x6c;
+                        const M: u32 = 0x6d;
+                        if !modifiers.alt {
+                            return FilterResult::Forward;
+                        }
+                        let sym = keysym.raw_syms().into_iter().next().map(u32::from);
+                        match sym {
+                            Some(Q) => {
+                                close_focused_window(state);
+                                FilterResult::Intercept(())
+                            }
+                            Some(H) | Some(L) => {
+                                let delta = if sym == Some(H) { -RATIO_STEP } else { RATIO_STEP };
+                                let ratio = state.layout.adjust_ratio(delta);
+                                let engine = state.layout;
+                                engine.apply(
+                                    &mut state.space,
+                                    &mut state.core,
+                                    &mut state.damage_all,
+                                );
+                                info!(
+                                    ratio,
+                                    "Master ratio adjusted (temporary Alt+H/L trigger)"
+                                );
+                                FilterResult::Intercept(())
+                            }
+                            Some(M) => {
+                                let kind = match state.layout.kind() {
+                                    LayoutKind::MasterStack => LayoutKind::Monocle,
+                                    LayoutKind::Monocle => LayoutKind::MasterStack,
+                                };
+                                state.layout.set_kind(kind);
+                                let engine = state.layout;
+                                engine.apply(
+                                    &mut state.space,
+                                    &mut state.core,
+                                    &mut state.damage_all,
+                                );
+                                info!(
+                                    ?kind,
+                                    "Layout mode switched (temporary Alt+M trigger)"
+                                );
+                                FilterResult::Intercept(())
+                            }
+                            _ => FilterResult::Forward,
                         }
                     },
                 );
@@ -378,26 +419,52 @@ pub fn dispatch_input_event(state: &mut RyoWmState, event: InputEvent) {
                 // resizes. A drag also focuses (above), like every major
                 // compositor. Any button release ends the drag.
                 if alt_held && matches!(button, BTN_LEFT | BTN_RIGHT | BTN_MIDDLE) {
-                    let dragged = state.space.element_under(position).and_then(
-                        |(window, _)| {
-                            window.toplevel()?;
-                            Some((window.clone(), window_output_rect(&state.space, window)))
-                        },
-                    );
-                    if let Some((window, geometry)) = dragged {
-                        let mode = if button == BTN_LEFT {
-                            DragMode::Move
-                        } else {
-                            DragMode::Resize
-                        };
-                        state.drag = Some(DragState {
-                            window,
-                            mode,
-                            start_pointer: position,
-                            start_geometry: geometry,
-                            last_sent_size: None,
-                        });
-                        info!(?mode, "Drag started (temporary Alt+drag trigger)");
+                    // Phase 5: only floating windows drag. A tiled window
+                    // would snap back on the next relayout, so the gesture
+                    // is declined (logged) instead of corrupting state. The
+                    // floating toggle in Phase 6 makes this path reachable.
+                    let under_cursor = state
+                        .space
+                        .element_under(position)
+                        .map(|(window, _)| window.clone());
+                    let has_window = under_cursor.is_some();
+                    let dragged = under_cursor.and_then(|window| {
+                        let surface = window.toplevel()?.wl_surface().clone();
+                        let id = state.core.window_id_for_surface(&surface)?;
+                        match state.core.windows.get(&id) {
+                            Some(record)
+                                if matches!(record.mode, WindowMode::Floating { .. }) =>
+                            {
+                                Some((
+                                    window.clone(),
+                                    window_output_rect(&state.space, &window),
+                                ))
+                            }
+                            _ => None,
+                        }
+                    });
+                    match (has_window, dragged) {
+                        (_, Some((window, geometry))) => {
+                            let mode = if button == BTN_LEFT {
+                                DragMode::Move
+                            } else {
+                                DragMode::Resize
+                            };
+                            state.drag = Some(DragState {
+                                window,
+                                mode,
+                                start_pointer: position,
+                                start_geometry: geometry,
+                                last_sent_size: None,
+                            });
+                            info!(?mode, "Drag started (temporary Alt+drag trigger)");
+                        }
+                        (true, None) => {
+                            tracing::debug!(
+                                "Alt+drag on tiled window ignored (floating toggle is Phase 6)"
+                            );
+                        }
+                        (false, _) => {}
                     }
                 }
             } else if state.drag.is_some() {

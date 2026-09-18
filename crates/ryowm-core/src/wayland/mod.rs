@@ -38,6 +38,7 @@ use smithay::{
 use tracing::{info, warn};
 
 use crate::{
+    layout::LayoutEngine,
     state::{CompositorState as CoreState, WindowState},
     window::{DragState, WindowMode, window_output_rect},
 };
@@ -86,6 +87,8 @@ pub struct RyoWmState {
     pub space: Space<Window>,
     /// Window lifecycle/focus/placement authority.
     pub core: CoreState,
+    /// Single-output layout state (per-workspace engines arrive in Phase 7).
+    pub layout: LayoutEngine,
     /// Active pointer drag (temporary Phase 4 trigger), if any.
     pub drag: Option<DragState>,
 
@@ -164,6 +167,7 @@ impl RyoWmState {
             pointer,
             space: Space::default(),
             core: CoreState::new(),
+            layout: LayoutEngine::new(),
             drag: None,
             pending_damage: None,
             damage_all: false,
@@ -187,6 +191,9 @@ impl RyoWmState {
 
     /// Mirror the committed scene geometry into the lifecycle record, so
     /// `WindowMode::Floating` always reflects reality instead of drifting.
+    /// Tiled windows are deliberately skipped: their geometry comes from the
+    /// layout compute, and writing scene geometry back over the mode would
+    /// corrupt the tiling/floating distinction.
     fn sync_stored_geometry(&mut self, window: &Window) {
         let rect = window_output_rect(&self.space, window);
         let Some(toplevel) = window.toplevel() else {
@@ -194,7 +201,9 @@ impl RyoWmState {
         };
         if let Some(id) = self.core.window_id_for_surface(toplevel.wl_surface()) {
             if let Some(state) = self.core.windows.get_mut(&id) {
-                state.mode = WindowMode::Floating { geometry: rect };
+                if matches!(state.mode, WindowMode::Floating { .. }) {
+                    state.mode = WindowMode::Floating { geometry: rect };
+                }
             }
         }
     }
@@ -262,20 +271,20 @@ impl XdgShellHandler for RyoWmState {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        // Send an initial configure so the client commits a buffer.
-        surface.with_pending_state(|state| {
-            state.size = Some((800, 600).into());
-        });
-        surface.send_configure();
-        // Cascade placement so consecutive windows don't perfectly overlap.
-        // Tiling-aware placement is Phase 5; focus is left untouched here
+        // New windows map as tiled: the layout pass below positions them
+        // and sends the initial configure with computed sizes (replacing
+        // Phase 4's cascade + fixed-size configure). Focus is left untouched
         // (click to focus) to keep focus changes auditable.
-        let (x, y) = self.core.next_cascade_location();
         let window = Window::new_wayland_window(surface);
         let id = self.core.alloc_window_id();
         let wl_surface = window
             .toplevel()
             .map(|toplevel| toplevel.wl_surface().clone());
+        // Cascade first: if the layout pass below skips this window (e.g.
+        // degenerate geometry guard), it still lands somewhere sensible
+        // instead of stacked at the origin. Floating placement in Phase 6
+        // reuses this same pattern.
+        let (x, y) = self.core.next_cascade_location();
         self.space.map_element(window, (x, y), false);
         if let Some(wl_surface) = wl_surface {
             self.core.windows.insert(
@@ -283,13 +292,13 @@ impl XdgShellHandler for RyoWmState {
                 WindowState {
                     id,
                     surface: wl_surface,
-                    mode: WindowMode::Floating {
-                        geometry: Rect::default(),
-                    },
+                    mode: WindowMode::Tiled,
                 },
             );
         }
-        info!(?id, x, y, "Mapped new toplevel (cascade placement)");
+        let engine = self.layout;
+        let applied = engine.apply(&mut self.space, &mut self.core, &mut self.damage_all);
+        info!(?id, applied, "Mapped new toplevel; layout applied");
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
@@ -346,7 +355,9 @@ impl XdgShellHandler for RyoWmState {
                 }
             }
         }
-        // The uncovered area needs repainting next frame.
+        // Re-tile the survivors, then repaint whatever remains uncovered.
+        let engine = self.layout;
+        engine.apply(&mut self.space, &mut self.core, &mut self.damage_all);
         self.damage_all = true;
     }
 

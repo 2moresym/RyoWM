@@ -36,16 +36,13 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    tracing::info!("RyoWM starting (Phase 3: input)");
+    tracing::info!("RyoWM starting (Phase 5: tiling)");
 
-    // Phase 3 exit criteria (task brief):
-    // 1. Real mouse motion moves a visible cursor.
-    // 2. Clicking a mapped window focuses it (focus change is logged).
-    // 3. Typing with focus delivers key events to that client.
-    // 4. Losing one input device neither crashes the compositor nor affects
-    //    other devices.
-    // 5. `cargo xtask check` still passes.
-    // 6. Idle CPU stays near zero with the input thread integrated.
+    // Phase 5 exit criteria (architecture doc §14):
+    // 1. Opening 3+ windows auto-tiles per the active algorithm.
+    // 2. Runtime layout parameter changes (master ratio) work.
+    // (Earlier criteria — commit ack, rendering, input, idle baseline —
+    // keep holding while tiling is added.)
 
     let reactor = reactor::Reactor::try_new()?;
     let display = Display::<wayland::RyoWmState>::new()?;
