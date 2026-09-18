@@ -23,7 +23,7 @@ use smithay::{
             Client, Display, DisplayHandle, Resource,
         },
     },
-    utils::{Clock, Monotonic, Physical, Size},
+    utils::{Clock, Monotonic, Physical, Size, SERIAL_COUNTER},
     wayland::{
         buffer::BufferHandler,
         compositor::{get_parent, CompositorClientState, CompositorHandler, CompositorState},
@@ -36,6 +36,11 @@ use smithay::{
     },
 };
 use tracing::{info, warn};
+
+use crate::{
+    state::{CompositorState as CoreState, WindowState},
+    window::{DragState, WindowMode, window_output_rect},
+};
 
 /// Per-client state stored by wayland-server. Required by `CompositorHandler`.
 #[derive(Debug, Default)]
@@ -75,9 +80,14 @@ pub struct RyoWmState {
     #[allow(dead_code)]
     pub pointer: PointerHandle<RyoWmState>,
 
-    // Desktop workspace. Phase 2 maps toplevels here for compositing only;
-    // window lifecycle/focus stay Phase 4 work (see `window/mod.rs`).
+    // Desktop workspace: the live scene. Lifecycle/focus records for the
+    // same windows live in `core` (see `state::CompositorState`); both are
+    // updated in the same handler on map/unmap/destroy.
     pub space: Space<Window>,
+    /// Window lifecycle/focus/placement authority.
+    pub core: CoreState,
+    /// Active pointer drag (temporary Phase 4 trigger), if any.
+    pub drag: Option<DragState>,
 
     /// Damage accumulated since the last presented frame, consumed by the
     /// scene renderer each iteration.
@@ -153,6 +163,8 @@ impl RyoWmState {
             seat,
             pointer,
             space: Space::default(),
+            core: CoreState::new(),
+            drag: None,
             pending_damage: None,
             damage_all: false,
             pending_resize: None,
@@ -173,14 +185,18 @@ impl RyoWmState {
             .cloned()
     }
 
-    fn window_rect(window: &Window) -> Rect {
-        let geometry = window.geometry();
-        Rect::new(
-            geometry.loc.x,
-            geometry.loc.y,
-            geometry.size.w,
-            geometry.size.h,
-        )
+    /// Mirror the committed scene geometry into the lifecycle record, so
+    /// `WindowMode::Floating` always reflects reality instead of drifting.
+    fn sync_stored_geometry(&mut self, window: &Window) {
+        let rect = window_output_rect(&self.space, window);
+        let Some(toplevel) = window.toplevel() else {
+            return;
+        };
+        if let Some(id) = self.core.window_id_for_surface(toplevel.wl_surface()) {
+            if let Some(state) = self.core.windows.get_mut(&id) {
+                state.mode = WindowMode::Floating { geometry: rect };
+            }
+        }
     }
 }
 
@@ -210,7 +226,8 @@ impl CompositorHandler for RyoWmState {
         match self.find_window_for_surface(surface) {
             Some(window) => {
                 window.on_commit();
-                let region = Self::window_rect(&window);
+                let region = window_output_rect(&self.space, &window);
+                self.sync_stored_geometry(&window);
                 if region.is_empty() {
                     self.damage_all = true;
                 } else {
@@ -250,16 +267,46 @@ impl XdgShellHandler for RyoWmState {
             state.size = Some((800, 600).into());
         });
         surface.send_configure();
-        // Phase 2 compositing attachment only: map the window so the renderer
-        // picks it up. Placement, focus, and lifecycle stay Phase 4 work —
-        // every mapped window stacks at the origin until tiling lands.
+        // Cascade placement so consecutive windows don't perfectly overlap.
+        // Tiling-aware placement is Phase 5; focus is left untouched here
+        // (click to focus) to keep focus changes auditable.
+        let (x, y) = self.core.next_cascade_location();
         let window = Window::new_wayland_window(surface);
-        self.space.map_element(window, (0, 0), false);
-        info!("New xdg_toplevel created, mapped for compositing, sent initial configure (800x600)");
+        let id = self.core.alloc_window_id();
+        let wl_surface = window
+            .toplevel()
+            .map(|toplevel| toplevel.wl_surface().clone());
+        self.space.map_element(window, (x, y), false);
+        if let Some(wl_surface) = wl_surface {
+            self.core.windows.insert(
+                id,
+                WindowState {
+                    id,
+                    surface: wl_surface,
+                    mode: WindowMode::Floating {
+                        geometry: Rect::default(),
+                    },
+                },
+            );
+        }
+        info!(?id, x, y, "Mapped new toplevel (cascade placement)");
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let destroyed = surface.wl_surface().clone();
+        // A drag in progress dies with its window — never manipulate a
+        // destroyed surface on the next motion event.
+        if let Some(drag) = &self.drag {
+            let dragging_dead = drag
+                .window
+                .toplevel()
+                .map(|toplevel| toplevel.wl_surface() == &destroyed)
+                .unwrap_or(false);
+            if dragging_dead {
+                self.drag = None;
+                info!("Cancelled drag: window destroyed mid-drag");
+            }
+        }
         // Bind first: a temporary in the `if let` scrutinee would keep the
         // immutable borrow of `space` alive across `unmap_elem` below.
         let removed = self
@@ -272,6 +319,32 @@ impl XdgShellHandler for RyoWmState {
         if let Some(window) = removed {
             self.space.unmap_elem(&window);
             info!("Unmapped destroyed toplevel");
+        }
+        // Forget lifecycle records; fall keyboard focus forward to the most
+        // recently used remaining window (or clear it) instead of dangling
+        // focus on a destroyed surface.
+        if let Some(id) = self.core.window_id_for_surface(&destroyed) {
+            let fallback = self.core.forget_window(id);
+            let serial = SERIAL_COUNTER.next_serial();
+            match fallback.and_then(|fallback| {
+                self.core
+                    .windows
+                    .get(&fallback)
+                    .map(|state| state.surface.clone())
+            }) {
+                Some(surface) => {
+                    if let Some(keyboard) = self.seat.get_keyboard() {
+                        keyboard.set_focus(self, Some(surface.clone()), serial);
+                    }
+                    info!(?fallback, "Keyboard focus fell back after close");
+                }
+                None => {
+                    if let Some(keyboard) = self.seat.get_keyboard() {
+                        keyboard.set_focus(self, None, serial);
+                    }
+                    info!("Keyboard focus cleared: no windows left");
+                }
+            }
         }
         // The uncovered area needs repainting next frame.
         self.damage_all = true;
