@@ -35,6 +35,7 @@ use std::{
 
 use calloop::EventLoop;
 use input::{Libinput, LibinputInterface};
+use ryowm_common::Rect;
 use rtrb::{Consumer, Producer, RingBuffer};
 use smithay::{
     backend::{
@@ -54,7 +55,10 @@ use smithay::{
 };
 use tracing::{debug, info, warn};
 
-use crate::wayland::RyoWmState;
+use crate::{
+    wayland::RyoWmState,
+    window::{DragMode, DragState, window_output_rect},
+};
 
 /// Normalized input event crossing the thread boundary. Plain data only —
 /// no Smithay/libinput types, so the channel stays `Send` by construction.
@@ -275,9 +279,31 @@ pub fn dispatch_input_event(state: &mut RyoWmState, event: InputEvent) {
             // Raw evdev code: Smithay applies the +8 XKB offset internally.
             // No keybind interception yet (Phase 8) — forward everything.
             if let Some(keyboard) = state.seat.get_keyboard() {
-                keyboard.input(state, code, key_state, serial, time_ms, |_, _, _| {
-                    FilterResult::<()>::Forward
-                });
+                keyboard.input(
+                    state,
+                    code,
+                    key_state,
+                    serial,
+                    time_ms,
+                    |state, modifiers, keysym| {
+                        // TEMPORARY Phase 4 placeholder trigger (the keybind
+                        // engine in Phase 8 replaces this, not extends it):
+                        // Alt+Q closes the focused window. Stateless: press
+                        // and release are both intercepted while Alt is held,
+                        // so no stuck keys. Alt (not Super) keeps nested
+                        // testing clear of the host compositor's Super
+                        // bindings. Raw (unshifted) syms, US layout assumed.
+                        const Q: u32 = 0x71;
+                        let close_requested = modifiers.alt
+                            && keysym.raw_syms().into_iter().any(|sym| u32::from(sym) == Q);
+                        if close_requested {
+                            close_focused_window(state);
+                            FilterResult::Intercept(())
+                        } else {
+                            FilterResult::Forward
+                        }
+                    },
+                );
             }
         }
         InputEvent::PointerMotion { dx, dy, time_ms } => {
@@ -307,6 +333,7 @@ pub fn dispatch_input_event(state: &mut RyoWmState, event: InputEvent) {
             // itself in `present` and forces a submission only then. Marking
             // full-output damage per motion event serialized presents on swap
             // vsync and visibly lagged clients under a moving cursor.
+            apply_drag(state, position);
         }
         InputEvent::PointerButton {
             button,
@@ -314,6 +341,15 @@ pub fn dispatch_input_event(state: &mut RyoWmState, event: InputEvent) {
             time_ms,
         } => {
             let serial = SERIAL_COUNTER.next_serial();
+            // Linux input-event-codes button numbers (stable ABI).
+            const BTN_LEFT: u32 = 0x110;
+            const BTN_RIGHT: u32 = 0x111;
+            const BTN_MIDDLE: u32 = 0x112;
+            // Alt modifier state, for the temporary drag triggers below.
+            let alt_held = state
+                .seat
+                .get_keyboard()
+                .is_some_and(|keyboard| keyboard.modifier_state().alt);
             if pressed {
                 // Focus-before-press: the click lands in the newly focused
                 // window, matching every major compositor's behavior.
@@ -326,6 +362,9 @@ pub fn dispatch_input_event(state: &mut RyoWmState, event: InputEvent) {
                     window.toplevel().map(|toplevel| toplevel.wl_surface().clone())
                 });
                 if let Some(surface) = target {
+                    if let Some(id) = state.core.window_id_for_surface(&surface) {
+                        state.core.focus_window(id);
+                    }
                     if let Some(keyboard) = state.seat.get_keyboard() {
                         keyboard.set_focus(state, Some(surface.clone()), serial);
                     }
@@ -334,6 +373,36 @@ pub fn dispatch_input_event(state: &mut RyoWmState, event: InputEvent) {
                         "Click focused window"
                     );
                 }
+                // TEMPORARY Phase 4 placeholder triggers (keybind engine is
+                // Phase 8): Alt+left-drag moves, Alt+right/middle-drag
+                // resizes. A drag also focuses (above), like every major
+                // compositor. Any button release ends the drag.
+                if alt_held && matches!(button, BTN_LEFT | BTN_RIGHT | BTN_MIDDLE) {
+                    let dragged = state.space.element_under(position).and_then(
+                        |(window, _)| {
+                            window.toplevel()?;
+                            Some((window.clone(), window_output_rect(&state.space, window)))
+                        },
+                    );
+                    if let Some((window, geometry)) = dragged {
+                        let mode = if button == BTN_LEFT {
+                            DragMode::Move
+                        } else {
+                            DragMode::Resize
+                        };
+                        state.drag = Some(DragState {
+                            window,
+                            mode,
+                            start_pointer: position,
+                            start_geometry: geometry,
+                            last_sent_size: None,
+                        });
+                        info!(?mode, "Drag started (temporary Alt+drag trigger)");
+                    }
+                }
+            } else if state.drag.is_some() {
+                state.drag = None;
+                info!("Drag ended");
             }
             if let Some(pointer) = state.seat.get_pointer() {
                 pointer.button(
@@ -350,6 +419,104 @@ pub fn dispatch_input_event(state: &mut RyoWmState, event: InputEvent) {
                     },
                 );
             }
+        }
+    }
+}
+
+/// Apply an in-progress drag to the current pointer position. Move
+/// repositions via the space (which raises within the z-layer — standard
+/// drag-to-front) and damages old∪new so no stale frame remains; resize
+/// sends an xdg configure and lets the client's commits drive geometry.
+fn apply_drag(state: &mut RyoWmState, position: Point<f64, Logical>) {
+    let Some(drag) = state.drag.as_ref() else {
+        return;
+    };
+    let (window, mode, start_pointer, start_geometry, last_sent) = (
+        drag.window.clone(),
+        drag.mode,
+        drag.start_pointer,
+        drag.start_geometry,
+        drag.last_sent_size,
+    );
+    match mode {
+        DragMode::Move => {
+            let new_x = start_geometry.x + (position.x - start_pointer.x).round() as i32;
+            let new_y = start_geometry.y + (position.y - start_pointer.y).round() as i32;
+            let old_rect = window_output_rect(&state.space, &window);
+            state.space.map_element(window.clone(), (new_x, new_y), false);
+            let new_rect = Rect::new(new_x, new_y, old_rect.width, old_rect.height);
+            let damaged = old_rect.union(&new_rect);
+            state.pending_damage = Some(match state.pending_damage {
+                Some(pending) => pending.union(&damaged),
+                None => damaged,
+            });
+            // Mirror into the lifecycle record (see `sync_stored_geometry`).
+            if let Some(id) = window
+                .toplevel()
+                .and_then(|toplevel| state.core.window_id_for_surface(toplevel.wl_surface()))
+            {
+                if let Some(record) = state.core.windows.get_mut(&id) {
+                    record.mode = crate::window::WindowMode::Floating { geometry: new_rect };
+                }
+            }
+        }
+        DragMode::Resize => {
+            let new_width = (start_geometry.width
+                + (position.x - start_pointer.x).round() as i32)
+                .max(80);
+            let new_height = (start_geometry.height
+                + (position.y - start_pointer.y).round() as i32)
+                .max(60);
+            if last_sent != Some((new_width, new_height)) {
+                if let Some(drag) = state.drag.as_mut() {
+                    drag.last_sent_size = Some((new_width, new_height));
+                }
+                if let Some(toplevel) = window.toplevel() {
+                    toplevel.with_pending_state(|pending| {
+                        pending.size = Some((new_width, new_height).into());
+                    });
+                    toplevel.send_configure();
+                    tracing::debug!(
+                        width = new_width,
+                        height = new_height,
+                        "Resize configure sent (temporary Alt+drag trigger)"
+                    );
+                }
+            }
+            // Stored geometry and damage follow the client's commits at the
+            // new size (see the commit handler) — never assumed here.
+        }
+    }
+}
+
+/// Close the focused window (temporary Alt+Q trigger). Sends the protocol
+/// close event; cleanup, damage, and focus fallback flow through the
+/// existing `toplevel_destroyed` path.
+fn close_focused_window(state: &mut RyoWmState) {
+    let Some(id) = state.core.focused else {
+        tracing::debug!("Alt+Q with no focused window; ignoring");
+        return;
+    };
+    let surface = state
+        .core
+        .windows
+        .get(&id)
+        .map(|record| record.surface.clone());
+    let Some(surface) = surface else {
+        tracing::debug!(?id, "Alt+Q for unknown window id; ignoring");
+        return;
+    };
+    let target = state
+        .space
+        .elements()
+        .find(|window| {
+            window.toplevel().map(|toplevel| toplevel.wl_surface()) == Some(&surface)
+        })
+        .cloned();
+    if let Some(window) = target {
+        if let Some(toplevel) = window.toplevel() {
+            toplevel.send_close();
+            info!(?id, "Closed focused window (temporary Alt+Q trigger)");
         }
     }
 }

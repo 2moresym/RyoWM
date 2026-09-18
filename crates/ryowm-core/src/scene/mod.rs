@@ -48,18 +48,11 @@ pub fn render_frame(
         if let Some(toplevel) = window.toplevel() {
             let surface = toplevel.wl_surface().clone();
             let handle = renderer.attach_surface(&surface);
-            let geometry = window.geometry();
-            renderer.composite_surface(
-                token,
-                handle,
-                ryowm_common::Rect::new(
-                    geometry.loc.x,
-                    geometry.loc.y,
-                    geometry.size.w,
-                    geometry.size.h,
-                ),
-                z as u32,
-            );
+            // Output-space rect (space location + committed geometry) — the
+            // shared convention in `window::window_output_rect`. Geometry
+            // alone would stack every window at the origin.
+            let rect = crate::window::window_output_rect(&state.space, window);
+            renderer.composite_surface(token, handle, rect, z as u32);
         }
     }
 
