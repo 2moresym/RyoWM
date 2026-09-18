@@ -33,10 +33,16 @@
 use ryowm_common::Rect;
 use smithay::desktop::{Space, Window};
 
-/// Lifecycle mode of a managed window. Floating only for now; `Tiled`
-/// arrives in Phase 5 as a new variant on this enum.
+/// Lifecycle mode of a managed window. New windows map as `Tiled` (Phase 5);
+/// `Floating` is assigned by the floating toggle (Phase 6) and keeps the
+/// explicit-geometry behavior proven in Phase 4. Floating windows render
+/// above tiled content and are never routed through a layout algorithm
+/// (architecture doc §2.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowMode {
+    /// Managed by the workspace's active `LayoutAlgorithm`; geometry always
+    /// comes from the last compute, never stored here.
+    Tiled,
     /// Explicit geometry, rendered above tiled content, never routed
     /// through a layout algorithm.
     Floating { geometry: Rect },
